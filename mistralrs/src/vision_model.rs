@@ -34,7 +34,7 @@ pub struct VisionModelBuilder {
     pub(crate) device_mapping: Option<DeviceMapSetting>,
     pub(crate) max_edge: Option<u32>,
     pub(crate) hf_cache_path: Option<PathBuf>,
-    pub(crate) search_bert_model: Option<BertEmbeddingModel>,
+    pub(crate) search_embedding_model: Option<SearchEmbeddingModel>,
     pub(crate) search_callback: Option<Arc<SearchCallback>>,
     pub(crate) tool_callbacks: HashMap<String, Arc<ToolCallback>>,
     pub(crate) tool_callbacks_with_tools: HashMap<String, ToolCallbackWithTool>,
@@ -54,6 +54,7 @@ pub struct VisionModelBuilder {
     pub(crate) paged_attn_cfg: Option<PagedAttentionConfig>,
     pub(crate) max_num_seqs: usize,
     pub(crate) with_logging: bool,
+    pub(crate) prefix_cache_n: Option<usize>,
 }
 
 impl VisionModelBuilder {
@@ -86,19 +87,20 @@ impl VisionModelBuilder {
             throughput_logging: false,
             paged_attn_cfg: None,
             hf_cache_path: None,
-            search_bert_model: None,
+            search_embedding_model: None,
             search_callback: None,
             tool_callbacks: HashMap::new(),
             tool_callbacks_with_tools: HashMap::new(),
             device: None,
             matformer_config_path: None,
             matformer_slice_name: None,
+            prefix_cache_n: None,
         }
     }
 
-    /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified or the default.
-    pub fn with_search(mut self, search_bert_model: BertEmbeddingModel) -> Self {
-        self.search_bert_model = Some(search_bert_model);
+    /// Enable searching compatible with the OpenAI `web_search_options` setting. This loads the selected search embedding reranker (EmbeddingGemma by default).
+    pub fn with_search(mut self, search_embedding_model: SearchEmbeddingModel) -> Self {
+        self.search_embedding_model = Some(search_embedding_model);
         self
     }
 
@@ -223,6 +225,12 @@ impl VisionModelBuilder {
     /// Set the maximum number of sequences which can be run at once.
     pub fn with_max_num_seqs(mut self, max_num_seqs: usize) -> Self {
         self.max_num_seqs = max_num_seqs;
+        self
+    }
+
+    /// Set the number of sequences to hold in the prefix cache. Set to `None` to disable the prefix cacher.
+    pub fn with_prefix_cache_n(mut self, n_seqs: Option<usize>) -> Self {
+        self.prefix_cache_n = n_seqs;
         self
     }
 
@@ -368,7 +376,7 @@ impl VisionModelBuilder {
             pipeline,
             scheduler_method,
             self.throughput_logging,
-            self.search_bert_model,
+            self.search_embedding_model,
         );
         if let Some(cb) = self.search_callback.clone() {
             runner = runner.with_search_callback(cb);
@@ -383,7 +391,13 @@ impl VisionModelBuilder {
                 callback_with_tool.tool.clone(),
             );
         }
-        let runner = runner.with_no_kv_cache(false).with_no_prefix_cache(false);
+        let mut runner = runner
+            .with_no_kv_cache(false)
+            .with_no_prefix_cache(self.prefix_cache_n.is_none());
+
+        if let Some(n) = self.prefix_cache_n {
+            runner = runner.with_prefix_cache_n(n)
+        }
 
         Ok(Model::new(runner.build().await))
     }

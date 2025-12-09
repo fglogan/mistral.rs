@@ -108,13 +108,20 @@ pub(crate) fn util_append_token_to_blocks(
         }
         None => {
             logical_token_blocks.push(LogicalTokenBlock::new(block_size));
+            // SAFETY: We just pushed a block, so last_mut() will return Some
             logical_token_blocks
                 .last_mut()
-                .unwrap()
+                .expect("just pushed a block, vector cannot be empty")
                 .append_token_id(tok);
         }
     }
-    if logical_token_blocks.last().as_ref().unwrap().is_full() {
+    // SAFETY: At this point, we either had a block or just created one above,
+    // so the vector is guaranteed to be non-empty.
+    if logical_token_blocks
+        .last()
+        .expect("logical_token_blocks should not be empty after appending")
+        .is_full()
+    {
         logical_token_blocks.push(LogicalTokenBlock::new(block_size));
     }
 }
@@ -405,6 +412,9 @@ pub struct Sequence {
 
     // Prefix caching
     prefill_prompt_toks: Option<Vec<u32>>,
+    /// Number of tokens at the start of the prompt that are cached (KV already computed).
+    /// These tokens should be skipped during prefill.
+    prefix_cache_len: usize,
 
     // Cache
     normal_cache: Vec<Option<KvCache>>,
@@ -413,6 +423,8 @@ pub struct Sequence {
     cache: LayerCaches,
     draft_cache: LayerCaches,
     xlora_cache: Option<LayerCaches>,
+    /// For hybrid models: index into the Mamba state pool
+    mamba_state_idx: Option<usize>,
 
     // Preallocated KV cache (k,v)
     seq_preallocated_cache: Option<(Tensor, Tensor)>,
@@ -489,6 +501,17 @@ impl BlockEngineSequence for Sequence {
         self.waitlisted_count += 1;
         prev
     }
+
+    fn set_prefix_cache_len(&mut self, len: usize) {
+        self.prefix_cache_len = len;
+    }
+
+    fn block_size(&self) -> usize {
+        match &self.custom_metadata {
+            SequenceCustomMetadata::PagedAttention { block_size, .. } => *block_size,
+            SequenceCustomMetadata::None => unreachable!(),
+        }
+    }
 }
 
 impl Sequence {
@@ -556,6 +579,7 @@ impl Sequence {
             } else {
                 None
             },
+            mamba_state_idx: None,
             seq_preallocated_cache,
             responder,
             sampler: sampler.into(),
@@ -571,6 +595,7 @@ impl Sequence {
             creation_time,
             recognizer,
             prefill_prompt_toks: None,
+            prefix_cache_len: 0,
             suffix,
             prefix,
             cumulative_logprob: 0.,
@@ -734,6 +759,17 @@ impl Sequence {
         self.token_offset
     }
 
+    /// Get the number of prefix tokens that are cached (KV already computed).
+    /// These tokens should be skipped during prefill.
+    pub fn prefix_cache_len(&self) -> usize {
+        self.prefix_cache_len
+    }
+
+    /// Set the number of prefix tokens that are cached.
+    pub fn set_prefix_cache_len(&mut self, len: usize) {
+        self.prefix_cache_len = len;
+    }
+
     /// This will also set prompt_len
     pub(crate) fn set_toks_and_reallocate(
         &mut self,
@@ -793,6 +829,14 @@ impl Sequence {
 
     pub fn scaling_cache(&mut self) -> &mut Option<Tensor> {
         &mut self.scaling_cache
+    }
+
+    pub fn mamba_state_idx(&self) -> Option<usize> {
+        self.mamba_state_idx
+    }
+
+    pub fn set_mamba_state_idx(&mut self, idx: Option<usize>) {
+        self.mamba_state_idx = idx;
     }
 
     pub fn is_xlora(&self) -> bool {
@@ -1010,6 +1054,11 @@ impl Sequence {
         self.update_time_info();
     }
 
+    pub fn add_embedding_choice_to_group(&self, embedding: Vec<f32>) {
+        get_mut_group!(self).embedding_choices.push(embedding);
+        self.update_time_info();
+    }
+
     pub fn add_completion_choice_to_group(&self, mut choice: CompletionChoice) {
         choice.text = format!(
             "{}{}{}",
@@ -1120,6 +1169,7 @@ pub struct SequenceGroup {
     image_choices: Vec<ImageChoice>,
     speech_pcms: Vec<(Arc<Vec<f32>>, usize, usize)>, // (pcm, rate, channels)
     raw_choices: Vec<(Vec<Tensor>, Vec<u32>)>,
+    embedding_choices: Vec<Vec<f32>>,
     completion_choices: Vec<(f32, CompletionChoice)>,
     pub chat_streaming_chunks: Vec<ChunkChoice>,
     pub completion_streaming_chunks: Vec<CompletionChunkChoice>,
@@ -1139,6 +1189,7 @@ impl SequenceGroup {
             image_choices: Vec::new(),
             speech_pcms: Vec::new(),
             raw_choices: Vec::new(),
+            embedding_choices: Vec::new(),
             completion_choices: Vec::new(),
             n_choices,
             total_prompt_toks: 0,
@@ -1223,6 +1274,27 @@ impl SequenceGroup {
                 .send(Response::Raw {
                     logits_chunks,
                     tokens,
+                })
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn maybe_send_embedding_done_response(
+        &self,
+        sender: Sender<Response>,
+    ) -> Result<(), SendError<Response>> {
+        if self.embedding_choices.len() == self.n_choices {
+            assert_eq!(self.embedding_choices.len(), 1);
+            let embeddings = self.embedding_choices[0].clone();
+            let prompt_tokens = self.total_prompt_toks;
+            let total_tokens = self.total_toks;
+            sender
+                .send(Response::Embeddings {
+                    embeddings,
+                    prompt_tokens,
+                    total_tokens,
                 })
                 .await?;
         }
